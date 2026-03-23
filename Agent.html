@@ -2378,14 +2378,26 @@ function manusStore(doc) {
         }
     });
     var caseNoMatch = txt.match(/(?:case\s*(?:no|number|#)[.:\s]+)([\w\-\/]+\d[\w\-\/]*)/i);
+    var causeNoMatch = txt.match(/(?:cause\s*(?:no|number|#)[.:\s]+)([\w\-\/\.\s]{1,30}\d[\w\-\/]*)/i);
     var courtMatch  = txt.match(/(?:in the\s+)?(?:united states\s+)?(?:district court[,\s]+(?:for\s+)?(?:the\s+)?([a-z\s]+district[^,\n]{0,40}))/i);
-    if (caseNoMatch || courtMatch) {
-        MANUS_DB.PROCEDURE_DB.push({
-            caseNo: caseNoMatch ? caseNoMatch[1] : 'Unknown',
-            court: courtMatch ? courtMatch[0].trim() : 'Unknown',
-            source: doc.name,
-            storedAt: ts
-        });
+    var stateMatch = txt.match(/\bstate\s+of\s+([A-Z][a-zA-Z\s]{2,20}?)(?=\s*[,\n]|\s+v\.|\s+vs\.|\s+plaintiff)/i);
+    var plaintiffMatch = txt.match(/(?:plaintiff|petitioner)[:\s]+([A-Z][A-Za-z\s\.,]{2,50}?)(?=\n|,|;|\s{2}|vs?\.)/i);
+    var defendantMatch = txt.match(/(?:defendant|respondent)[:\s]+([A-Z][A-Za-z\s\.,]{2,50}?)(?=\n|,|;|\s{2})/i);
+    var resolvedCaseNo = (caseNoMatch ? caseNoMatch[1] : '') || (causeNoMatch ? causeNoMatch[1].trim() : '') || 'Unknown';
+    if (caseNoMatch || causeNoMatch || courtMatch || stateMatch || plaintiffMatch || defendantMatch) {
+        var existingProc = MANUS_DB.PROCEDURE_DB.some(function(p) { return p.source === doc.name; });
+        if (!existingProc) {
+            MANUS_DB.PROCEDURE_DB.push({
+                caseNo: resolvedCaseNo,
+                causeNo: causeNoMatch ? causeNoMatch[1].trim() : resolvedCaseNo,
+                court: courtMatch ? courtMatch[0].trim() : 'Unknown',
+                state: stateMatch ? stateMatch[1].trim() : '',
+                plaintiff: plaintiffMatch ? plaintiffMatch[1].trim() : (stateMatch ? 'State of ' + stateMatch[1].trim() : ''),
+                defendant: defendantMatch ? defendantMatch[1].trim() : '',
+                source: doc.name,
+                storedAt: ts
+            });
+        }
     }
     var chargePatterns = [
         /(?:count\s+[IVX\d]+[:\s]+)([^\n.]{10,80})/gi,
@@ -2452,11 +2464,38 @@ function manusProcedureReport() {
 }
 function manusInjectContext(userMessage) {
     if (!MANUS_DB.DOCS_STORED.length) return userMessage;
-    var ctx = '[MANUS DB] ';
-    if (MANUS_DB.PARTIES_DB.length) ctx += 'Parties: ' + MANUS_DB.PARTIES_DB.map(function(p){return p.name+'('+p.role+')';}).join('; ') + ' | ';
-    if (MANUS_DB.CLAIMS_DB.length) ctx += 'Claims: ' + MANUS_DB.CLAIMS_DB.slice(0,3).map(function(c){return c.claim;}).join('; ') + ' | ';
-    if (MANUS_DB.PROCEDURE_DB.length) ctx += 'Case: ' + MANUS_DB.PROCEDURE_DB[0].caseNo + ' ' + MANUS_DB.PROCEDURE_DB[0].court;
-    return ctx + '\n\n' + userMessage;
+    var ctx = '══════════════════════════════════════════════════\n';
+    ctx += 'MANUS SESSION DATABASE — AUTO-EXTRACTED CASE DATA\n';
+    ctx += '══════════════════════════════════════════════════\n';
+    // Procedure / parties block (primary source)
+    if (MANUS_DB.PROCEDURE_DB.length) {
+        var proc = MANUS_DB.PROCEDURE_DB[0];
+        if (proc.plaintiff) ctx += 'PLAINTIFF:  ' + proc.plaintiff + '\n';
+        if (proc.defendant) ctx += 'DEFENDANT:  ' + proc.defendant + '\n';
+        if (proc.state)     ctx += 'STATE:      ' + proc.state + '\n';
+        if (proc.causeNo && proc.causeNo !== 'Unknown') ctx += 'CAUSE NO.:  ' + proc.causeNo + '\n';
+        else if (proc.caseNo && proc.caseNo !== 'Unknown') ctx += 'CASE NO.:   ' + proc.caseNo + '\n';
+        if (proc.court && proc.court !== 'Unknown') ctx += 'COURT:      ' + proc.court + '\n';
+    }
+    // Additional parties from PARTIES_DB
+    if (MANUS_DB.PARTIES_DB.length) {
+        var byRole = {};
+        MANUS_DB.PARTIES_DB.forEach(function(p) {
+            if (!byRole[p.role]) byRole[p.role] = [];
+            byRole[p.role].push(p.name);
+        });
+        Object.keys(byRole).forEach(function(role) {
+            ctx += role.toUpperCase() + ': ' + byRole[role].join(', ') + '\n';
+        });
+    }
+    // Claims
+    if (MANUS_DB.CLAIMS_DB.length) {
+        ctx += 'CHARGES/CLAIMS: ' + MANUS_DB.CLAIMS_DB.slice(0,5).map(function(c){return c.claim;}).join(' | ') + '\n';
+    }
+    ctx += '══════════════════════════════════════════════════\n';
+    ctx += 'USE THE ABOVE EXTRACTED PARTY DATA TO POPULATE ALL DOCUMENTS. DO NOT USE PLACEHOLDER BRACKETS — USE THE REAL NAMES AND CASE NUMBERS ABOVE.\n';
+    ctx += '══════════════════════════════════════════════════\n\n';
+    return ctx + userMessage;
 }
 // ── SELF-THINKING ENGINE v2 — RESERVED / INACTIVE (v17 security patch) ──
 // BUG-4 FIX: All callers removed. Function retained as no-op stub.
@@ -2748,8 +2787,48 @@ function resolveProvider() {
 // Interprets the system prompt rules + user message and generates
 // structured legal analysis output entirely in the browser.
 // ── CLAUDE API STREAMING — used when API key is configured ──
+// ── MULTIMODAL CONTENT PARSER — Converts [IMAGE_DATA_URL:...] tokens to Claude vision API format ──
+// Enables Claude to actually SEE uploaded document images for word-for-word extraction
+function parseMultimodalContent(text) {
+    if (!text || text.indexOf('[IMAGE_DATA_URL:') === -1) return null;
+    var parts = [];
+    // Split on IMAGE_DATA_URL tokens — captures the full data URL between brackets
+    var segments = text.split(/\[IMAGE_DATA_URL:(data:image\/[^;]{1,40};base64,[^\]]{50,})\]/);
+    for (var i = 0; i < segments.length; i++) {
+        if (i % 2 === 0) {
+            // Text segment
+            if (segments[i] && segments[i].trim()) {
+                parts.push({ type: 'text', text: segments[i] });
+            }
+        } else {
+            // Image data URL segment — convert to Claude image block
+            var dataUrl = segments[i];
+            var mimeMatch = dataUrl.match(/^data:(image\/[^;]+);base64,/);
+            if (mimeMatch) {
+                var mediaType = mimeMatch[1]; // e.g. "image/jpeg", "image/png"
+                var base64Data = dataUrl.substring(mimeMatch[0].length);
+                if (base64Data.length > 100) {
+                    parts.push({
+                        type: 'image',
+                        source: { type: 'base64', media_type: mediaType, data: base64Data }
+                    });
+                }
+            }
+        }
+    }
+    // Only return multimodal array if at least one image block was found
+    var hasImage = parts.some(function(p) { return p.type === 'image'; });
+    if (!hasImage) return null;
+    // Claude API requires at least one text block in multimodal messages
+    if (!parts.some(function(p) { return p.type === 'text'; })) {
+        parts.unshift({ type: 'text', text: 'Extract every word from this document image verbatim in Times New Roman 12pt format. Do not skip any words. Do not fabricate any words.' });
+    }
+    return parts;
+}
 async function claudeAPIStream(systemPrompt, userMessage, apiKey, onToken) {
     var model = (load('e2zero_api_keys', {}) || {}).claude_model || 'claude-sonnet-4-6';
+    // Convert [IMAGE_DATA_URL:...] tokens to multimodal vision content blocks
+    var msgContent = parseMultimodalContent(userMessage);
     var resp = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
         headers: {
@@ -2762,7 +2841,7 @@ async function claudeAPIStream(systemPrompt, userMessage, apiKey, onToken) {
             max_tokens: 8192,
             temperature: 0.1,
             system: systemPrompt,
-            messages: [{ role: 'user', content: userMessage }],
+            messages: [{ role: 'user', content: msgContent !== null ? msgContent : userMessage }],
             stream: true
         })
     });
@@ -3324,10 +3403,41 @@ function universalDocumentExtraction(docText) {
         while ((m = p.exec(src)) !== null) { if (citations.indexOf(m[0]) === -1) citations.push(m[0].trim()); }
     });
     var caseNo = (src.match(/(?:case\s*(?:no|number|#|num)[.:\s]+)([\w\-\/]+\d[\w\-\/]*)/i) || ['',''])[1] || '';
+    // Cause number — Indiana and many states use "Cause No." instead of "Case No."
+    var causeNo = (src.match(/(?:cause\s*(?:no|number|#)[.:\s]+)([\w\-\/\.\s]{1,30}\d[\w\-\/]*)/i) || ['',''])[1] || caseNo || '';
     var court = (src.match(/(?:in\s+the\s+)([\w\s]+court[^\n,]*)/i) || ['',''])[1] || '';
     var officer = (src.match(/(?:officer|deputy|detective|affiant)[:\s]+([A-Z][a-z]+(?:\s+[A-Z]\.?)?\s+[A-Z][a-z]+)/i) || ['',''])[1] || '';
+    // Extract state — "State of Indiana", "STATE OF INDIANA", caption-style "v." separation
+    var stateMatch = src.match(/\bstate\s+of\s+([A-Z][a-zA-Z\s]{2,20}?)(?=\s*[,\n]|\s+v\.|\s+vs\.|\s+plaintiff|\s+petitioner)/i);
+    var state = stateMatch ? stateMatch[1].trim() : '';
+    if (!state) {
+        // Try "People of the State of ..."
+        var peopleMatch = src.match(/\bpeople\s+of\s+the\s+state\s+of\s+([A-Z][a-zA-Z\s]{2,20}?)(?=\s*[,\n])/i);
+        if (peopleMatch) state = peopleMatch[1].trim();
+    }
+    // Extract specific plaintiff and defendant names with role labels
+    var plaintiff = '';
+    var defendant = '';
+    // Pattern 1: "Plaintiff: Name" or "PLAINTIFF NAME" caption style
+    var plaintiffMatch = src.match(/(?:plaintiff|petitioner)[:\s]+([A-Z][A-Za-z\s\.,]{2,50}?)(?=\n|,|;|\s{2}|vs?\.|\bdefendant\b)/i);
+    if (plaintiffMatch) plaintiff = plaintiffMatch[1].trim().replace(/\s+/g, ' ');
+    // If state found and no plaintiff yet, state IS the plaintiff in criminal matters
+    if (!plaintiff && state) plaintiff = 'State of ' + state;
+    // Pattern 2: "Defendant: Name" caption style
+    var defendantMatch = src.match(/(?:defendant|respondent|accused)[:\s]+([A-Z][A-Za-z\s\.,]{2,50}?)(?=\n|,|;|\s{2})/i);
+    if (defendantMatch) defendant = defendantMatch[1].trim().replace(/\s+/g, ' ');
+    // Pattern 3: Parse case caption "STATE OF X v. JOHN DOE" or "John Doe, Defendant"
+    if (!defendant) {
+        var captionVMatch = src.match(/(?:state of \w+|[A-Z][A-Za-z\s]+)\s+v(?:s?)\.?\s+([A-Z][A-Za-z\s\.,]{2,50}?)(?=\n|,|;|\s{2})/i);
+        if (captionVMatch) defendant = captionVMatch[1].trim().replace(/\s+/g, ' ');
+    }
+    if (!defendant) {
+        var defLabelMatch = src.match(/([A-Z][A-Za-z\s\.,]{2,50}?),\s*(?:Defendant|Respondent|Accused)/i);
+        if (defLabelMatch) defendant = defLabelMatch[1].trim().replace(/\s+/g, ' ');
+    }
     return { docType: docType, parties: parties, charges: charges, dates: dates, facts: facts,
-             citations: citations, caseNo: caseNo, court: court, officer: officer, fullText: src };
+             citations: citations, caseNo: caseNo, causeNo: causeNo, court: court, officer: officer,
+             state: state, plaintiff: plaintiff, defendant: defendant, fullText: src };
 }
 // ── Constitutional Violation Detection (Universal) ──
 function detectAllConstitutionalViolations(docText, extracted) {
@@ -3484,8 +3594,12 @@ async function generateUniversalAnalysis(agentName, docText, question, hasDoc, e
     o += 'SECTION 1 — DOCUMENT ANALYSIS\n';
     o += '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n';
     o += 'DOCUMENT TYPE: ' + extracted.docType + '\n';
-    if (extracted.caseNo) o += 'CASE NUMBER: ' + extracted.caseNo + '\n';
-    if (extracted.court) o += 'COURT: ' + extracted.court + '\n';
+    if (extracted.plaintiff) o += 'PLAINTIFF:    ' + extracted.plaintiff + '\n';
+    if (extracted.defendant) o += 'DEFENDANT:    ' + extracted.defendant + '\n';
+    if (extracted.state)     o += 'STATE:        ' + extracted.state + '\n';
+    if (extracted.causeNo && extracted.causeNo !== extracted.caseNo) o += 'CAUSE NO.:    ' + extracted.causeNo + '\n';
+    if (extracted.caseNo)  o += 'CASE NUMBER:  ' + extracted.caseNo + '\n';
+    if (extracted.court)   o += 'COURT:        ' + extracted.court + '\n';
     if (extracted.officer) o += 'AFFIANT/OFFICER: ' + extracted.officer + '\n';
     o += '\n';
     if (extracted.dates.length) {
@@ -6249,6 +6363,9 @@ async function askFirm(firmId, pageId) {
     // Build message — DOCUMENT-FOCUS HARD DIRECTIVE
     var fullMessage = '';
     if (docs.length > 0) {
+        // Auto-store uploaded docs in MANUS DB for party/case extraction
+        docs.forEach(function(d) { manusStore(d); });
+        var hasImages = docs.some(function(d) { return d.isImage || (d.content && d.content.indexOf('[IMAGE_DATA_URL:') !== -1); });
         fullMessage += '═══════════════════════════════════════════════\n';
         fullMessage += 'CRITICAL: PRESENTER HAS UPLOADED ' + docs.length + ' DOCUMENT' + (docs.length > 1 ? 'S' : '') + ' TO THIS FIRM.\n';
         fullMessage += 'ALL 300 ATTORNEYS AND THE 15-MEMBER EXPERT TEAM MUST:\n';
@@ -6257,6 +6374,12 @@ async function askFirm(firmId, pageId) {
         fullMessage += '3. Extract every legal term, citation, procedural posture, and embedded authority.\n';
         fullMessage += '4. Identify every issue, defect, presumption, and remedy visible in these documents.\n';
         fullMessage += '5. Produce no generic responses — the documents are the ONLY source of facts.\n';
+        if (hasImages) {
+            fullMessage += '6. IMAGE DOCUMENT UPLOADED — Extract EVERY SINGLE WORD from the image verbatim.\n';
+            fullMessage += '   DO NOT skip any words. DO NOT fabricate any words. DO NOT output symbols, squares, or triangles.\n';
+            fullMessage += '   Output the complete extracted text in clean Times New Roman 12pt format.\n';
+            fullMessage += '   Names, dates, case numbers, signatures, stamps — extract ALL of it word-for-word.\n';
+        }
         fullMessage += '═══════════════════════════════════════════════\n\n';
         docs.forEach(function(d, i) {
             fullMessage += '═══ UPLOADED DOCUMENT ' + (i + 1) + ': ' + d.name + ' (' + Math.round(d.size / 1024 * 10) / 10 + ' KB) ═══\n';
@@ -6275,7 +6398,7 @@ async function askFirm(firmId, pageId) {
     resultEl.appendChild(document.createTextNode(' Engaging firm...'));
     var accumulated = '';
     var systemPrompt = getSystemPrompt(agentId);
-    // Inject MANUS DB context
+    // Inject MANUS DB context (auto-extracted party info: plaintiff, defendant, state, causeNo)
     fullMessage = manusInjectContext(fullMessage);
     try {
         var finalText = await callLLMStream(systemPrompt, fullMessage, function(token) {
@@ -6482,6 +6605,9 @@ async function runDocAnalyzer() {
     // Build message — CRITICAL document directive
     var fullMessage = '';
     if (daDocs_store.length > 0) {
+        // Auto-store in MANUS DB for party/case extraction
+        daDocs_store.forEach(function(d) { manusStore(d); });
+        var daHasImages = daDocs_store.some(function(d) { return d.isImage || (d.content && d.content.indexOf('[IMAGE_DATA_URL:') !== -1); });
         fullMessage += '═══════════════════════════════════════════════\n';
         fullMessage += 'CRITICAL: PRESENTER HAS UPLOADED ' + daDocs_store.length + ' DOCUMENT' + (daDocs_store.length > 1 ? 'S' : '') + ' FOR 30-ATTORNEY PANEL ANALYSIS.\n';
         fullMessage += 'ALL 30 ATTORNEYS MUST:\n';
@@ -6491,6 +6617,11 @@ async function runDocAnalyzer() {
         fullMessage += '4. Identify every legal term, citation, procedural posture, and embedded authority.\n';
         fullMessage += '5. Produce no generic responses — the documents are the ONLY source of facts.\n';
         fullMessage += '6. Draw from CJS, AmJur, and Black\'s Law Dictionary for every definition and doctrine cited.\n';
+        if (daHasImages) {
+            fullMessage += '7. IMAGE DOCUMENT: Extract EVERY SINGLE WORD verbatim from each image.\n';
+            fullMessage += '   DO NOT skip words. DO NOT fabricate words. DO NOT output symbols, squares, triangles.\n';
+            fullMessage += '   Output complete extracted text in Times New Roman 12pt format.\n';
+        }
         fullMessage += '═══════════════════════════════════════════════\n\n';
         daDocs_store.forEach(function(d, i) {
             fullMessage += '═══ UPLOADED DOCUMENT ' + (i + 1) + ': ' + d.name + ' (' + Math.round(d.size / 1024 * 10) / 10 + ' KB) ═══\n';
@@ -6526,6 +6657,8 @@ async function runDocAnalyzer() {
         fullMessage += '(6) Give STEP BY STEP instructions on how to file each document\n';
         fullMessage += '(7) QUOTE THE DOCUMENT. Do not be generic. Every conclusion must point back to specific language in the uploaded document.\n';
         fullMessage += '═══════════════════════════════════════════════\n';
+    // Inject MANUS DB context (auto-extracted party info)
+    fullMessage = manusInjectContext(fullMessage);
     // Execute streaming call
     var systemPrompt = getSystemPrompt('doc_analyzer');
     var accumulated = '';
@@ -8600,16 +8733,22 @@ var DEFENDANT_FIRST_ENGINE = (function() {
     // ── MAIN EXECUTE FUNCTION — Used by askFirm when Claude key present ──
     async function executeAnalysis(agentType, docText, userQuestion, apiKey, onProgress) {
         if (!apiKey) throw new Error('Claude API key required');
-        var docStructure = extractDocumentStructure(docText);
-        var violations = detectConstitutionalViolations(docText, docStructure);
-        var remedies = generateRemedies(docText, docStructure, violations);
+        // Separate image tokens from text content to prevent base64 corruption by substring()
+        var hasImages = docText && docText.indexOf('[IMAGE_DATA_URL:') !== -1;
+        var cleanDocText = hasImages
+            ? docText.replace(/\[IMAGE_DATA_URL:[^\]]{50,}\]/g, '[IMAGE ATTACHED — extract every word verbatim]')
+            : docText;
+        var docStructure = extractDocumentStructure(cleanDocText);
+        var violations = detectConstitutionalViolations(cleanDocText, docStructure);
+        var remedies = generateRemedies(cleanDocText, docStructure, violations);
         var learnedStrategies = LearningMemory.getTopStrategies(agentType, 10);
         var systemPrompt = buildMasterSystemPrompt(agentType, userQuestion, learnedStrategies);
         var userMessage =
             '═══════════════════════════════════════════════════════════\n' +
             'DOCUMENT FOR ANALYSIS (' + docStructure.type + ')\n' +
             '═══════════════════════════════════════════════════════════\n\n' +
-            'FULL DOCUMENT TEXT:\n' + docText.substring(0, 180000) + '\n\n' +
+            (hasImages ? 'IMAGE DOCUMENT: Extract EVERY word verbatim from the attached image(s). No skipping. No fabricating.\n\n' : '') +
+            'FULL DOCUMENT TEXT:\n' + cleanDocText.substring(0, 180000) + '\n\n' +
             '═══════════════════════════════════════════════════════════\n' +
             'PRE-EXTRACTED STRUCTURE (VERIFY, EXPAND, AND CORRECT):\n' +
             '═══════════════════════════════════════════════════════════\n\n' +
@@ -8643,6 +8782,22 @@ var DEFENDANT_FIRST_ENGINE = (function() {
             '6. Minimum 3000 words. Maximum depth required. Defendant-first bias throughout.\n' +
             '7. Every conclusion must reference specific document language.\n\n' +
             'BEGIN EXHAUSTIVE DEFENDANT-FIRST ANALYSIS NOW:';
+        // If the original docText had images, append them at the end for vision processing
+        if (hasImages) {
+            var imgRegex = /\[IMAGE_DATA_URL:(data:image\/[^;]{1,40};base64,[^\]]{50,})\]/g;
+            var imgMatch;
+            var imgSection = '\n\n═══ ATTACHED DOCUMENT IMAGES — EXTRACT EVERY WORD ═══\n';
+            var imgCount = 0;
+            while ((imgMatch = imgRegex.exec(docText)) !== null) {
+                imgSection += '[IMAGE_DATA_URL:' + imgMatch[1] + ']\n';
+                imgCount++;
+            }
+            if (imgCount > 0) userMessage += imgSection;
+        }
+        // Convert [IMAGE_DATA_URL:...] tokens to multimodal vision blocks
+        var msgContent = (typeof parseMultimodalContent === 'function')
+            ? parseMultimodalContent(userMessage)
+            : null;
         // Call Claude API with streaming
         var keys = load('e2zero_api_keys', {});
         var model = keys.claude_model || 'claude-sonnet-4-6';
@@ -8658,7 +8813,7 @@ var DEFENDANT_FIRST_ENGINE = (function() {
                 max_tokens: HARD_LOCK.maxOutputTokens,
                 temperature: HARD_LOCK.temperature,
                 system: systemPrompt,
-                messages: [{ role: 'user', content: userMessage }],
+                messages: [{ role: 'user', content: msgContent !== null ? msgContent : userMessage }],
                 stream: true
             })
         });
